@@ -1,7 +1,11 @@
 """PDF 읽기 및 섹션 파싱 모듈"""
 import fitz  # PyMuPDF
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
+
+# 헤더/푸터 여백 상수 (pt)
+HEADER_MARGIN = 50.0  # 상단 헤더 영역 제외
+FOOTER_MARGIN = 50.0  # 하단 푸터 영역 제외
 
 
 @dataclass
@@ -17,6 +21,75 @@ class Section:
     def __str__(self):
         indent = "  " * (self.level - 1)
         return f"{indent}{self.title} (p.{self.start_page + 1}-{self.end_page + 1})"
+
+
+@dataclass
+class MergedSection:
+    """병합된 섹션 정보"""
+    parent: Section
+    children: list[Section] = field(default_factory=list)
+
+
+def get_max_level(sections: list[Section]) -> int:
+    """섹션 리스트에서 최대 레벨 반환"""
+    if not sections:
+        return 0
+    return max(s.level for s in sections)
+
+
+def merge_sections_by_level(sections: list[Section], split_level: Optional[int]) -> list[MergedSection]:
+    """
+    섹션을 지정된 레벨까지만 분리하고 나머지는 병합
+
+    Args:
+        sections: 전체 섹션 리스트
+        split_level: 파일로 분리할 최대 레벨 (None이면 모든 레벨 개별 파일)
+
+    Returns:
+        병합된 섹션 리스트
+    """
+    if not sections:
+        return []
+
+    # split_level이 None이면 모든 섹션 개별 파일
+    if split_level is None:
+        return [MergedSection(parent=s, children=[]) for s in sections]
+
+    result = []
+    i = 0
+
+    while i < len(sections):
+        section = sections[i]
+
+        # split_level 이하 레벨은 개별 파일로
+        if section.level <= split_level:
+            merged = MergedSection(parent=section, children=[])
+
+            # 다음 섹션들 중 직접 하위이면서 split_level 초과인 것들만 children에 추가
+            # 중간에 split_level 이하 섹션이 나오면 그 섹션이 새 파일이 되므로 중단
+            j = i + 1
+            while j < len(sections):
+                next_section = sections[j]
+
+                # 같은 레벨이거나 상위 레벨이면 중단
+                if next_section.level <= section.level:
+                    break
+
+                # split_level 이하 레벨이면 새 파일이 되므로 중단
+                # (이 섹션이 하위 섹션들을 가져감)
+                if next_section.level <= split_level:
+                    break
+
+                # split_level 초과 레벨만 children에 추가
+                merged.children.append(next_section)
+
+                j += 1
+
+            result.append(merged)
+
+        i += 1
+
+    return result
 
 
 class PDFReader:
@@ -139,9 +212,31 @@ class PDFReader:
 
         return sections
 
+    def _get_table_rects(self, page, valid_top: float, valid_bottom: float) -> list:
+        """페이지에서 유효 범위 내 표들의 영역(bbox) 반환"""
+        table_rects = []
+        tables = list(page.find_tables())
+        for table in tables:
+            table_rect = table.bbox
+            table_top = table_rect[1]
+            table_bottom = table_rect[3]
+            # 표가 유효 범위 내에 있는지 확인
+            if table_top >= valid_top and table_bottom <= valid_bottom:
+                table_rects.append(fitz.Rect(table_rect))
+        return table_rects
+
     def extract_text(self, start_page: int, end_page: int,
-                     start_y: float = 0.0, end_y: float = float('inf')) -> str:
-        """지정된 페이지/좌표 범위의 텍스트 추출"""
+                     start_y: float = 0.0, end_y: float = float('inf'),
+                     exclude_tables: bool = True) -> str:
+        """지정된 페이지/좌표 범위의 텍스트 추출 (헤더/푸터 영역 및 표 영역 제외)
+
+        Args:
+            start_page: 시작 페이지 (0-indexed)
+            end_page: 끝 페이지 (0-indexed)
+            start_y: 시작 Y좌표
+            end_y: 끝 Y좌표
+            exclude_tables: True이면 표 영역의 텍스트 제외 (기본값: True)
+        """
         if not self.doc:
             return ""
 
@@ -151,29 +246,58 @@ class PDFReader:
                 page = self.doc[page_num]
                 page_height = page.rect.height
 
-                # 클리핑 영역 계산
+                # 클리핑 영역 계산 (헤더/푸터 여백 적용)
                 if page_num == start_page and page_num == end_page:
                     # 시작과 끝이 같은 페이지
-                    clip_top = start_y
-                    clip_bottom = end_y if end_y != float('inf') else page_height
+                    clip_top = max(start_y, HEADER_MARGIN)
+                    clip_bottom = min(end_y, page_height - FOOTER_MARGIN) if end_y != float('inf') else page_height - FOOTER_MARGIN
                 elif page_num == start_page:
-                    # 시작 페이지: start_y부터 페이지 끝까지
-                    clip_top = start_y
-                    clip_bottom = page_height
+                    # 시작 페이지: start_y부터 페이지 끝까지 (푸터 제외)
+                    clip_top = max(start_y, HEADER_MARGIN)
+                    clip_bottom = page_height - FOOTER_MARGIN
                 elif page_num == end_page:
-                    # 끝 페이지: 페이지 시작부터 end_y까지
-                    clip_top = 0
-                    clip_bottom = end_y if end_y != float('inf') else page_height
+                    # 끝 페이지: 헤더 제외하고 end_y까지
+                    clip_top = HEADER_MARGIN
+                    clip_bottom = min(end_y, page_height - FOOTER_MARGIN) if end_y != float('inf') else page_height - FOOTER_MARGIN
                 else:
-                    # 중간 페이지: 전체
-                    clip_top = 0
-                    clip_bottom = page_height
+                    # 중간 페이지: 헤더/푸터 제외
+                    clip_top = HEADER_MARGIN
+                    clip_bottom = page_height - FOOTER_MARGIN
 
-                # 클리핑 영역으로 텍스트 추출
+                # 표 영역 가져오기 (표 텍스트 제외 옵션이 켜진 경우)
+                table_rects = []
+                if exclude_tables:
+                    table_rects = self._get_table_rects(page, clip_top, clip_bottom)
+
+                # 텍스트 블록 단위로 추출하여 표 영역 제외
                 clip_rect = fitz.Rect(0, clip_top, page.rect.width, clip_bottom)
-                text = page.get_text(clip=clip_rect)
-                if text.strip():
-                    text_parts.append(text)
+                blocks = page.get_text("dict", clip=clip_rect)["blocks"]
+
+                page_text_parts = []
+                for block in blocks:
+                    if block["type"] != 0:  # 텍스트 블록만 처리 (type 0)
+                        continue
+
+                    block_rect = fitz.Rect(block["bbox"])
+
+                    # 표 영역과 겹치는지 확인
+                    is_in_table = False
+                    for table_rect in table_rects:
+                        if block_rect.intersects(table_rect):
+                            is_in_table = True
+                            break
+
+                    if not is_in_table:
+                        # 블록 내 모든 라인의 텍스트 추출
+                        for line in block.get("lines", []):
+                            line_text = ""
+                            for span in line.get("spans", []):
+                                line_text += span.get("text", "")
+                            if line_text.strip():
+                                page_text_parts.append(line_text)
+
+                if page_text_parts:
+                    text_parts.append("\n".join(page_text_parts))
 
         return "\n".join(text_parts)
 
@@ -188,7 +312,7 @@ class PDFReader:
 
     def extract_tables(self, start_page: int, end_page: int,
                        start_y: float = 0.0, end_y: float = float('inf')) -> list[list[list[str]]]:
-        """지정된 페이지/좌표 범위의 표 추출"""
+        """지정된 페이지/좌표 범위의 표 추출 (헤더/푸터 영역 제외)"""
         if not self.doc:
             return []
 
@@ -197,7 +321,8 @@ class PDFReader:
             if 0 <= page_num < self.page_count:
                 page = self.doc[page_num]
                 page_height = page.rect.height
-                tables = page.find_tables()
+                # 기본 전략으로 표 감지 (경계선 기반, 더 정확함)
+                tables = list(page.find_tables())
 
                 for table in tables:
                     # 표의 위치 확인
@@ -205,19 +330,19 @@ class PDFReader:
                     table_top = table_rect[1]  # y0
                     table_bottom = table_rect[3]  # y1
 
-                    # 현재 페이지에서의 유효 범위 계산
+                    # 현재 페이지에서의 유효 범위 계산 (헤더/푸터 여백 적용)
                     if page_num == start_page and page_num == end_page:
-                        valid_top = start_y
-                        valid_bottom = end_y if end_y != float('inf') else page_height
+                        valid_top = max(start_y, HEADER_MARGIN)
+                        valid_bottom = min(end_y, page_height - FOOTER_MARGIN) if end_y != float('inf') else page_height - FOOTER_MARGIN
                     elif page_num == start_page:
-                        valid_top = start_y
-                        valid_bottom = page_height
+                        valid_top = max(start_y, HEADER_MARGIN)
+                        valid_bottom = page_height - FOOTER_MARGIN
                     elif page_num == end_page:
-                        valid_top = 0
-                        valid_bottom = end_y if end_y != float('inf') else page_height
+                        valid_top = HEADER_MARGIN
+                        valid_bottom = min(end_y, page_height - FOOTER_MARGIN) if end_y != float('inf') else page_height - FOOTER_MARGIN
                     else:
-                        valid_top = 0
-                        valid_bottom = page_height
+                        valid_top = HEADER_MARGIN
+                        valid_bottom = page_height - FOOTER_MARGIN
 
                     # 표가 유효 범위 내에 있는지 확인
                     if table_top >= valid_top and table_bottom <= valid_bottom:

@@ -5,7 +5,7 @@ from pathlib import Path
 import threading
 from typing import Optional
 
-from core.pdf_reader import PDFReader, Section
+from core.pdf_reader import PDFReader, Section, MergedSection, get_max_level, merge_sections_by_level
 from core.md_converter import MarkdownConverter
 
 
@@ -15,12 +15,14 @@ class PDFSplitterApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("PDF to Markdown Splitter")
-        self.root.geometry("600x550")
+        self.root.geometry("700x650")
         self.root.resizable(True, True)
 
         self.pdf_path: Optional[str] = None
         self.sections: list[Section] = []
         self.section_vars: list[tk.BooleanVar] = []
+        self.max_level: int = 0
+        self.split_level_var: tk.StringVar = tk.StringVar(value="모든 레벨")
 
         self._setup_ui()
 
@@ -74,6 +76,29 @@ class PDFSplitterApp:
 
         deselect_all_btn = ttk.Button(btn_frame, text="전체 해제", command=self._deselect_all)
         deselect_all_btn.pack(side=tk.LEFT)
+
+        # 분리 레벨 선택
+        level_frame = ttk.LabelFrame(main_frame, text="분리 레벨", padding="5")
+        level_frame.pack(fill=tk.X, pady=(0, 10))
+
+        level_label = ttk.Label(level_frame, text="파일 분리 기준 레벨:")
+        level_label.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.level_combo = ttk.Combobox(
+            level_frame,
+            textvariable=self.split_level_var,
+            state="readonly",
+            width=15
+        )
+        self.level_combo['values'] = ["모든 레벨"]
+        self.level_combo.pack(side=tk.LEFT)
+
+        level_help = ttk.Label(
+            level_frame,
+            text="(선택한 레벨까지만 개별 파일로 분리)",
+            foreground="gray"
+        )
+        level_help.pack(side=tk.LEFT, padx=(10, 0))
 
         # 출력 폴더
         output_frame = ttk.LabelFrame(main_frame, text="출력 폴더", padding="5")
@@ -163,7 +188,13 @@ class PDFSplitterApp:
                     )
                     cb.pack(anchor=tk.W)
 
-            self.status_var.set(f"{len(self.sections)}개 섹션 감지됨")
+                # 최대 레벨 감지 및 콤보박스 업데이트
+                self.max_level = get_max_level(self.sections)
+                level_options = ["모든 레벨"] + [f"레벨 {i}" for i in range(1, self.max_level + 1)]
+                self.level_combo['values'] = level_options
+                self.split_level_var.set("모든 레벨")
+
+            self.status_var.set(f"{len(self.sections)}개 섹션 감지됨 (최대 레벨: {self.max_level})")
 
         except Exception as e:
             messagebox.showerror("오류", f"PDF 로드 실패:\n{e}")
@@ -178,6 +209,14 @@ class PDFSplitterApp:
         """모든 섹션 선택 해제"""
         for var in self.section_vars:
             var.set(False)
+
+    def _get_split_level(self) -> Optional[int]:
+        """선택된 분리 레벨 반환"""
+        level_str = self.split_level_var.get()
+        if level_str == "모든 레벨":
+            return None
+        # "레벨 N" 형식에서 N 추출
+        return int(level_str.split()[-1])
 
     def _start_conversion(self):
         """변환 시작"""
@@ -204,20 +243,31 @@ class PDFSplitterApp:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
 
+        # 분리 레벨 가져오기
+        split_level = self._get_split_level()
+
+        # 선택된 섹션들만 필터링
+        selected_sections = [section for _, section in selected]
+
+        # 섹션 병합
+        merged_sections = merge_sections_by_level(selected_sections, split_level)
+
         # UI 비활성화
         self.convert_btn.configure(state='disabled')
         self.progress['value'] = 0
-        self.progress['maximum'] = len(selected)
+        # 프로그레스: 추출 단계 + 저장 단계
+        total_steps = len(selected_sections) + len(merged_sections)
+        self.progress['maximum'] = total_steps
 
         # 백그라운드 스레드에서 변환 실행
         thread = threading.Thread(
-            target=self._do_conversion,
-            args=(selected, output_path)
+            target=self._do_conversion_merged,
+            args=(merged_sections, selected_sections, output_path)
         )
         thread.start()
 
     def _do_conversion(self, selected: list[tuple[int, Section]], output_path: Path):
-        """변환 실행 (백그라운드 스레드)"""
+        """변환 실행 (백그라운드 스레드) - 레거시"""
         try:
             converter = MarkdownConverter()
 
@@ -240,6 +290,52 @@ class PDFSplitterApp:
             self.root.after(0, lambda: self._conversion_complete(output_path))
 
         except Exception as e:
+            self.root.after(0, lambda: self._conversion_error(str(e)))
+
+    def _do_conversion_merged(self, merged_sections: list, selected_sections: list[Section], output_path: Path):
+        """병합된 섹션 변환 실행 (백그라운드 스레드)"""
+        try:
+            converter = MarkdownConverter()
+            total_extract = len(selected_sections)
+            total_save = len(merged_sections)
+            print(f"[DEBUG] 변환 시작: {total_extract}개 섹션 추출, {total_save}개 파일 저장 예정")
+
+            with PDFReader(self.pdf_path) as reader:
+                # 1단계: 모든 선택된 섹션의 콘텐츠를 추출
+                section_contents = {}
+
+                for idx, section in enumerate(selected_sections, 1):
+                    # 상태 업데이트
+                    self.root.after(0, lambda s=section.title, i=idx, t=total_extract:
+                        self.status_var.set(f"추출 중 ({i}/{t}): {s}"))
+                    print(f"[DEBUG] 추출 중 ({idx}/{total_extract}): {section.title}")
+
+                    text = reader.extract_section_text(section)
+                    tables = reader.extract_section_tables(section)
+                    section_contents[section.title] = (text, tables)
+
+                    # 프로그레스 업데이트
+                    self.root.after(0, lambda v=idx: self._update_progress(v))
+
+                print(f"[DEBUG] 추출 완료, 저장 시작...")
+
+                # 2단계: 병합된 섹션별로 저장
+                for idx, merged in enumerate(merged_sections, 1):
+                    # 상태 업데이트
+                    self.root.after(0, lambda s=merged.parent.title, i=idx, t=total_save:
+                        self.status_var.set(f"저장 중 ({i}/{t}): {s}"))
+                    print(f"[DEBUG] 저장 중 ({idx}/{total_save}): {merged.parent.title}")
+
+                    converter.save_merged_section(output_path, merged, section_contents, idx)
+
+                    # 프로그레스 업데이트 (추출 수 + 현재 저장 인덱스)
+                    self.root.after(0, lambda v=total_extract + idx: self._update_progress(v))
+
+            print(f"[DEBUG] 변환 완료!")
+            self.root.after(0, lambda: self._conversion_complete(output_path))
+
+        except Exception as e:
+            print(f"[DEBUG] 오류 발생: {e}")
             self.root.after(0, lambda: self._conversion_error(str(e)))
 
     def _update_progress(self, value: int):
